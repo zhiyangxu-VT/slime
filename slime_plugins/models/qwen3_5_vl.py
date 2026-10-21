@@ -48,6 +48,31 @@ class Qwen3_5MultimodalRotaryEmbedding(MultimodalRotaryEmbedding):
         return emb
 
 
+class _FP32VisionRotaryEmbedding(torch.nn.Module):
+    """Keep analytic RoPE frequencies precise through Megatron BF16 wrapping.
+
+    HF's nonpersistent inv_freq is otherwise rounded by Module.to/bfloat16.
+    Regenerate rather than upcast the rounded buffer, including after moves.
+    """
+
+    def __init__(self, rotary):
+        super().__init__()
+        self.dim = rotary.dim
+        self.theta = rotary.theta
+        self.register_buffer("inv_freq", self._frequencies(rotary.inv_freq.device), persistent=False)
+
+    def _frequencies(self, device):
+        return 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim))
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        self.inv_freq = self._frequencies(self.inv_freq.device)
+        return self
+
+    def forward(self, position_ids):
+        return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
+
+
 def _load_vision_model(hf_config, dtype: torch.dtype, use_cpu_initialization: bool):
     if hf_config.model_type == "qwen3_5_moe":
         from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeVisionModel
@@ -61,6 +86,7 @@ def _load_vision_model(hf_config, dtype: torch.dtype, use_cpu_initialization: bo
     device = torch.device("cpu") if use_cpu_initialization else accelerator.current_device()
     with torch.device(device):
         vision_model = vision_model_cls._from_config(hf_config.vision_config)
+    vision_model.rotary_pos_emb = _FP32VisionRotaryEmbedding(vision_model.rotary_pos_emb)
     vision_model.to(dtype=dtype)
 
     # HF modules are replicated across TP ranks. Mark them explicitly so slime's

@@ -14,6 +14,66 @@ sys.path.insert(0, str(ROOT))
 NUM_GPUS = 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel regression")
+def test_native_fused_gated_norm_matches_serving_and_gradient_oracle():
+    from fla.modules.fused_norm_gate import rms_norm_gated
+    from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
+
+    tree = ast.parse((ROOT / "slime_plugins/models/qwen3_5_native.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Qwen3_5NativeAttention")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_apply_gated_norm")
+    namespace = {"rms_norm_gated": rms_norm_gated}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "native_gated_norm", "exec"), namespace)
+    torch.manual_seed(17)
+    x = torch.randn(7, 3, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    gate = torch.randn_like(x, requires_grad=True)
+    weight = (torch.randn(128, device="cuda") * 0.1 + 1).bfloat16().requires_grad_()
+    native = SimpleNamespace(out_norm=SimpleNamespace(weight=weight), config=SimpleNamespace(layernorm_epsilon=1e-6))
+    actual = namespace["_apply_gated_norm"](native, x, gate).reshape_as(x)
+    serving = RMSNorm(128, eps=1e-6, norm_before_gate=True, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        serving.weight.copy_(weight)
+        expected_serving = serving(x.detach().reshape(-1, 128), gate.detach().reshape(-1, 128)).reshape_as(x)
+    torch.testing.assert_close(actual, expected_serving, rtol=0.008, atol=0.004)
+    rx, rg, rw = [value.detach().float().requires_grad_() for value in (x, gate, weight)]
+    reference_norm = rx * torch.rsqrt(rx.square().mean(-1, keepdim=True) + 1e-6) * rw
+    reference = reference_norm * torch.nn.functional.silu(rg)
+    legacy = (reference_norm.detach().bfloat16().float() * torch.nn.functional.silu(gate.detach().float())).bfloat16()
+    new_error = (actual.detach().float() - expected_serving.float()).abs().mean()
+    old_error = (legacy.float() - expected_serving.float()).abs().mean()
+    assert new_error < old_error * 0.1
+    actual.float().square().mean().backward()
+    reference.square().mean().backward()
+    for value, oracle in [(x, rx), (gate, rg), (weight, rw)]:
+        assert torch.isfinite(value.grad).all() and value.grad.norm() > 0
+        torch.testing.assert_close(value.grad.float(), oracle.grad, rtol=0.025, atol=2e-4)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"))])
+def test_native_decay_uses_fp32_exponential_and_preserves_gradients(device):
+    tree = ast.parse((ROOT / "slime_plugins/models/qwen3_5_native.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Qwen3_5NativeAttention")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_compute_g_and_beta")
+    namespace = {"torch": torch, "F": torch.nn.functional}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "native_gdn_decay", "exec"), namespace)
+    decay = torch.tensor([0.5, 1.25, 2.0], device=device, dtype=torch.bfloat16, requires_grad=True)
+    bias = torch.tensor([-0.3, 0.1, 0.7], device=device, dtype=torch.bfloat16, requires_grad=True)
+    alpha = torch.tensor([[0.2, -1.1, 0.4], [0.8, 0.3, -0.6]], device=device, dtype=torch.bfloat16, requires_grad=True)
+    beta = torch.zeros_like(alpha, requires_grad=True)
+    g, actual_beta = namespace["_compute_g_and_beta"](None, decay, bias, alpha, beta)
+    expected = -decay.float().exp() * torch.nn.functional.softplus(alpha.float() + bias.float())
+    assert g.dtype == torch.float32
+    torch.testing.assert_close(g, expected, rtol=0, atol=0)
+    legacy = -decay.exp() * torch.nn.functional.softplus(alpha.float() + bias)
+    assert (g - legacy).abs().max() > 1e-3
+    (g.sum() + actual_beta.float().sum()).backward()
+    torch.testing.assert_close(decay.grad, expected.detach().sum(0).bfloat16(), rtol=0.01, atol=1e-3)
+    alpha_grad = -decay.detach().float().exp() * torch.sigmoid(alpha.detach().float() + bias.detach().float())
+    torch.testing.assert_close(alpha.grad, alpha_grad.bfloat16(), rtol=0.01, atol=1e-3)
+    torch.testing.assert_close(bias.grad, alpha_grad.sum(0).bfloat16(), rtol=0.01, atol=1e-3)
+    torch.testing.assert_close(beta.grad, torch.full_like(beta, 0.25), rtol=0, atol=0)
+
+
 def load_functions(relative, names, **namespace):
     path = ROOT / relative
     definitions = [n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name in names]
@@ -37,9 +97,7 @@ def converter_modules():
         torch=torch,
         re=re,
     )
-    shard = load_functions(
-        "slime/backends/megatron_utils/hf_to_megatron/common.py", {"_tensor_parallel_shard"}, torch=torch
-    )
+    shard = load_functions("slime/backends/megatron_utils/hf_to_megatron/common.py", {"_tensor_parallel_shard"}, torch=torch)
     return namespace["qwen3_5_hf_tensor"], exported["convert_qwen3_5_to_hf"], shard["_tensor_parallel_shard"]
 
 
@@ -60,10 +118,7 @@ def test_native_checkpoint_to_shards_to_serving_roundtrip(tp_size, mode):
         "linear_attn.norm.weight": (3,),
         "linear_attn.out_proj.weight": (8, 12),
     }
-    tensors = {
-        prefix + name: (torch.arange(torch.tensor(shape).prod()).reshape(shape) / 16).bfloat16()
-        for name, shape in shapes.items()
-    }
+    tensors = {prefix + name: (torch.arange(torch.tensor(shape).prod()).reshape(shape) / 16).bfloat16() for name, shape in shapes.items()}
     # These directly stored norm scales must survive without a lossy +/-1 transform.
     tensors[prefix + "linear_attn.norm.weight"] = torch.tensor([0.003, 0.123, 1.75], dtype=torch.bfloat16)
     reader = SimpleNamespace(get_tensor=tensors.__getitem__)
@@ -116,9 +171,7 @@ def test_native_checkpoint_to_shards_to_serving_roundtrip(tp_size, mode):
             {"_merge_param_partitions", "all_gather_param", "all_gather_params_async"},
             torch=torch,
             dist=SimpleNamespace(all_gather=all_gather),
-            mpu=SimpleNamespace(
-                get_tensor_model_parallel_world_size=lambda: tp_size, get_tensor_model_parallel_group=lambda: None
-            ),
+            mpu=SimpleNamespace(get_tensor_model_parallel_world_size=lambda: tp_size, get_tensor_model_parallel_group=lambda: None),
         )
         if mode == "sync":
             result = gather["all_gather_param"](name, local)
@@ -145,14 +198,9 @@ def test_native_checkpoint_to_shards_to_serving_roundtrip(tp_size, mode):
 )
 def test_existing_tp_layouts_still_roundtrip(tp_size, name, shape, dim, stride):
     _, _, shard = converter_modules()
-    merge = load_functions(
-        "slime/backends/megatron_utils/update_weight/common.py", {"_merge_param_partitions"}, torch=torch
-    )["_merge_param_partitions"]
+    merge = load_functions("slime/backends/megatron_utils/update_weight/common.py", {"_merge_param_partitions"}, torch=torch)["_merge_param_partitions"]
     full = torch.arange(torch.tensor(shape).prod()).reshape(shape)
-    parts = [
-        shard(name, full, parallel_size=tp_size, parallel_rank=rank, partition_dim=dim, partition_stride=stride)
-        for rank in range(tp_size)
-    ]
+    parts = [shard(name, full, parallel_size=tp_size, parallel_rank=rank, partition_dim=dim, partition_stride=stride) for rank in range(tp_size)]
     assert torch.equal(merge(name, parts, dim), full)
 
 
@@ -218,9 +266,7 @@ def test_native_packed_validation_reuses_offsets_and_rechecks_edits(monkeypatch,
     module = types.ModuleType("megatron.core.ssm.gated_delta_net.gdn")
     module.GatedDeltaNet = GDN
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    spec = importlib.util.spec_from_file_location(
-        "native_offset_test", ROOT / "slime_plugins/models/qwen3_5_native.py"
-    )
+    spec = importlib.util.spec_from_file_location("native_offset_test", ROOT / "slime_plugins/models/qwen3_5_native.py")
     native = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(native)
     layers = [native.Qwen3_5NativeAttention.__new__(native.Qwen3_5NativeAttention) for _ in range(2)]
@@ -279,15 +325,11 @@ def test_spec_changes_only_linear_attention_layers(monkeypatch, implementation):
         _get_text_config=lambda value: value,
         get_num_layers_to_build=lambda config, vp_stage: 2,
         get_transformer_layer_offset=lambda config, vp_stage: 0,
-        get_gpt_decoder_block_spec=lambda *args, **kwargs: SimpleNamespace(
-            layer_specs=[SimpleNamespace(submodules=SimpleNamespace(self_attention=ordinary)) for _ in range(2)]
-        ),
+        get_gpt_decoder_block_spec=lambda *args, **kwargs: SimpleNamespace(layer_specs=[SimpleNamespace(submodules=SimpleNamespace(self_attention=ordinary)) for _ in range(2)]),
         Attention=replicated,
         ModuleSpec=SimpleNamespace,
     )
-    args = SimpleNamespace(
-        num_experts=None, hf_checkpoint="unused", qwen_gdn_implementation=implementation, qwen_gdn_backend="fla"
-    )
+    args = SimpleNamespace(num_experts=None, hf_checkpoint="unused", qwen_gdn_implementation=implementation, qwen_gdn_backend="fla")
     config = SimpleNamespace(num_layers=2, pipeline_model_parallel_layout=None)
     spec = namespace["get_qwen3_5_spec"](args, config, None)
     assert spec.layer_specs[1].submodules.self_attention is ordinary
@@ -318,3 +360,24 @@ def test_invalid_projection_sections_are_rejected():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_vision_rope_retains_analytic_fp32_after_recursive_bf16_conversion():
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionRotaryEmbedding
+
+    tree = ast.parse((ROOT / "slime_plugins/models/qwen3_5_vl.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_FP32VisionRotaryEmbedding")
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), "vision_rope", "exec"), namespace)
+    reference = Qwen3_5VisionRotaryEmbedding(36)
+    fixed = namespace["_FP32VisionRotaryEmbedding"](reference)
+    positions = torch.arange(16).repeat(2).reshape(-1, 2)
+    expected = reference(positions)
+    legacy = Qwen3_5VisionRotaryEmbedding(36).bfloat16()
+    assert (legacy(positions) - expected).abs().max() > 0.005
+    parent = torch.nn.Sequential(fixed)
+    for dtype in (torch.bfloat16, torch.float16, torch.float32, torch.bfloat16):
+        parent.to(dtype=dtype)
+        assert fixed.inv_freq.dtype == torch.float32
+        torch.testing.assert_close(fixed(positions), expected, rtol=0, atol=0)
+    assert not fixed.state_dict(), "RoPE frequencies must not alter checkpoint keys"

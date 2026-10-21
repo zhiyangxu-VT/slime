@@ -3,10 +3,50 @@
 import copy
 
 import torch
+import torch.nn.functional as F
+from fla.modules.fused_norm_gate import rms_norm_gated
 from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
 
 
 class Qwen3_5NativeAttention(GatedDeltaNet):
+    def _prepare_input_for_gated_delta_rule(self, qkv, gate, batch, seq_len, *gate_feats):
+        result = super()._prepare_input_for_gated_delta_rule(qkv, gate, batch, seq_len, *gate_feats)
+        trace = getattr(self, "_coding_rl_replay_trace", None)
+        if trace is not None:
+            trace.record("components.gdn_convolution", qkv.reshape(-1, qkv.shape[-1]))
+            for name, value in zip(("query", "key", "value"), result[:3]):
+                trace.record(f"components.gdn_{name}", value.reshape(-1, value.shape[-2] * value.shape[-1]))
+        return result
+
+    def _apply_gated_norm(self, x, gate):
+        # Preserve the FP32 norm/scale/gate intermediates used by Qwen's FLA
+        # fast path and SGLang. A standalone BF16 norm rounds too early.
+        # Reuse the original parameter, including its TP gradient metadata.
+        trace = getattr(self, "_coding_rl_replay_trace", None)
+        if trace is not None:
+            trace.record("components.gdn_raw", x.reshape(-1, x.shape[-2] * x.shape[-1]))
+            trace.record("components.gdn_gate", gate.reshape(-1, gate.shape[-2] * gate.shape[-1]))
+        return rms_norm_gated(
+            x.reshape(-1, x.shape[-1]),
+            gate.reshape(-1, gate.shape[-1]),
+            self.out_norm.weight,
+            None,
+            activation="swish",
+            eps=self.config.layernorm_epsilon,
+        )
+
+    def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
+        # Qwen evaluates the decay exponent in FP32 even with BF16 weights.
+        # MCore's default exp on the BF16 parameter rounds before multiplying
+        # the FP32 softplus, which accumulates over recurrent layers.
+        g = -A_log_local_cp.float().exp() * F.softplus(alpha.float() + dt_bias_local_cp.float())
+        beta = beta.sigmoid()
+        trace = getattr(self, "_coding_rl_replay_trace", None)
+        if trace is not None:
+            trace.record("components.gdn_decay", g.reshape(-1, g.shape[-1]))
+            trace.record("components.gdn_beta", beta.reshape(-1, beta.shape[-1]))
+        return g, beta
+
     def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size=1):
         cu_seqlens = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens_actual
         # Every layer and its recomputation share the same immutable batch

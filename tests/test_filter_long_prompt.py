@@ -26,15 +26,14 @@ NUM_GPUS = 0
 
 
 @pytest.fixture
-def stub_process_vision_info(monkeypatch):
+def stub_processing_kwargs(monkeypatch):
     """`slime.utils.processing_utils` pulls in transformers + PIL.
 
-    The multimodal branch imports it lazily, and only `process_vision_info` is
-    needed here, so stub the module rather than requiring transformers on the
-    CPU image.
+    The filter must reuse already extracted image inputs after chat rendering.
+    Stub only the kwargs adapter so the test needs no transformers installation.
     """
     module = types.ModuleType("slime.utils.processing_utils")
-    module.process_vision_info = lambda prompt, processor: {"images": None}
+    module.build_processor_kwargs = lambda inputs: dict(inputs)
     monkeypatch.setitem(sys.modules, "slime.utils.processing_utils", module)
 
 
@@ -49,6 +48,7 @@ class _Processor:
     """Per-sample processor stand-in, same length convention."""
 
     def __call__(self, text=None, **kwargs):
+        assert kwargs["images"] == ["img"], "Rendered prompts must retain extracted images"
         return {"input_ids": [[0] * _encoded_length(text)]}
 
 
@@ -67,7 +67,7 @@ def _make_samples(specs):
 
 
 @pytest.mark.unit
-def test_preserves_order_when_nothing_is_filtered(stub_process_vision_info):
+def test_preserves_order_when_nothing_is_filtered(stub_processing_kwargs):
     # Alternating modality, every prompt well under the limit.
     samples = _make_samples([(i % 2 == 0, 5) for i in range(6)])
 
@@ -77,7 +77,7 @@ def test_preserves_order_when_nothing_is_filtered(stub_process_vision_info):
 
 
 @pytest.mark.unit
-def test_preserves_order_when_some_are_filtered(stub_process_vision_info):
+def test_preserves_order_when_some_are_filtered(stub_processing_kwargs):
     specs = [
         (True, 5),  # p0 multimodal, keep
         (False, 500),  # p1 text-only, drop
@@ -95,7 +95,7 @@ def test_preserves_order_when_some_are_filtered(stub_process_vision_info):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("all_multimodal", [True, False])
-def test_single_modality_batches_are_unchanged(stub_process_vision_info, all_multimodal):
+def test_single_modality_batches_are_unchanged(stub_processing_kwargs, all_multimodal):
     samples = _make_samples([(all_multimodal, 5)] * 4)
 
     kept = filter_long_prompt(samples, _Tokenizer(), _Processor(), max_length=100)
